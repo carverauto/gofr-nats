@@ -156,14 +156,18 @@ func New(conf *Config, logger pubsub.Logger, metrics Metrics) (pubsub.Client, er
 }
 */
 
-// New creates a new NATS client without connecting.
-func New(cfg *Config) *Client {
-	return &Client{
+// New creates and returns a new Client.
+func New(cfg *Config) *PubSubWrapper {
+	if cfg == nil {
+		cfg = &Config{} // Provide default config if nil
+	}
+	client := &Client{
 		Config:        cfg,
 		Subscriptions: make(map[string]*subscription),
 		messageBuffer: make(chan *pubsub.Message, cfg.BatchSize),
 		bufferSize:    cfg.BatchSize,
 	}
+	return &PubSubWrapper{Client: client}
 }
 
 // UseLogger sets the logger for the NATS client.
@@ -188,10 +192,18 @@ func (n *Client) UseMetrics(metrics any) {
 }
 
 // Connect establishes a connection to NATS and sets up JetStream.
-// Connect establishes a connection to NATS and sets up JetStream.
 func (n *Client) Connect() {
+	if n.Config == nil {
+		if n.Logger != nil {
+			n.Logger.Error("NATS configuration is nil")
+		}
+		return
+	}
+
 	if err := ValidateConfigs(n.Config); err != nil {
-		n.Logger.Errorf("could not initialize NATS JetStream: %v", err)
+		if n.Logger != nil {
+			n.Logger.Errorf("could not initialize NATS JetStream: %v", err)
+		}
 		return
 	}
 
@@ -202,21 +214,27 @@ func (n *Client) Connect() {
 
 	nc, err := nats.Connect(n.Config.Server, opts...)
 	if err != nil {
-		n.Logger.Errorf("failed to connect to NATS server at %v: %v", n.Config.Server, err)
+		if n.Logger != nil {
+			n.Logger.Errorf("failed to connect to NATS server at %v: %v", n.Config.Server, err)
+		}
 		return
 	}
 
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
-		n.Logger.Errorf("failed to create JetStream context: %v", err)
+		if n.Logger != nil {
+			n.Logger.Errorf("failed to create JetStream context: %v", err)
+		}
 		return
 	}
 
 	n.Conn = &natsConnWrapper{nc}
 	n.JetStream = js
 
-	n.Logger.Logf("connected to NATS server '%s'", n.Config.Server)
+	if n.Logger != nil {
+		n.Logger.Logf("connected to NATS server '%s'", n.Config.Server)
+	}
 }
 
 // Publish publishes a message to a topic.
