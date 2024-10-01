@@ -101,6 +101,7 @@ func (w *natsConnWrapper) NatsConn() *nats.Conn {
 }
 
 // New creates and returns a new Client Client.
+/*
 func New(conf *Config, logger pubsub.Logger, metrics Metrics) (pubsub.Client, error) {
 	if err := ValidateConfigs(conf); err != nil {
 		logger.Errorf("could not initialize Client JetStream: %v", err)
@@ -148,6 +149,62 @@ func New(conf *Config, logger pubsub.Logger, metrics Metrics) (pubsub.Client, er
 	}
 
 	return &PubSubWrapper{Client: client}, nil
+}
+*/
+
+// New creates a new NATS client without connecting.
+func New(cfg *Config) *Client {
+	return &Client{
+		Config:        cfg,
+		Subscriptions: make(map[string]*subscription),
+	}
+}
+
+// UseLogger sets the logger for the NATS client.
+func (n *Client) UseLogger(logger any) {
+	if l, ok := logger.(pubsub.Logger); ok {
+		n.Logger = l
+	}
+}
+
+// UseMetrics sets the metrics for the NATS client.
+func (n *Client) UseMetrics(metrics any) {
+	if m, ok := metrics.(Metrics); ok {
+		n.Metrics = m
+	}
+}
+
+// Connect establishes a connection to NATS and sets up JetStream.
+func (n *Client) Connect() error {
+	if err := ValidateConfigs(n.Config); err != nil {
+		n.Logger.Errorf("could not initialize NATS JetStream: %v", err)
+		return err
+	}
+
+	opts := []nats.Option{nats.Name("GoFr NATS JetStreamClient")}
+	if n.Config.CredsFile != "" {
+		opts = append(opts, nats.UserCredentials(n.Config.CredsFile))
+	}
+
+	nc, err := nats.Connect(n.Config.Server, opts...)
+	if err != nil {
+		n.Logger.Errorf("failed to connect to NATS server at %v: %v", n.Config.Server, err)
+		return err
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		n.Logger.Errorf("failed to create JetStream context: %v", err)
+		return err
+	}
+
+	n.Conn = &natsConnWrapper{nc}
+	n.JetStream = js
+
+	n.Logger.Logf("connected to NATS server '%s'", n.Config.Server)
+
+	return nil
 }
 
 // Publish publishes a message to a topic.
