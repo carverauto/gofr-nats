@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -260,38 +261,6 @@ func (n *Client) Publish(ctx context.Context, subject string, message []byte) er
 	return nil
 }
 
-// Subscribe subscribes to a topic.
-/*
-func (n *Client) Subscribe(ctx context.Context, topic string, handler messageHandler) error {
-	if n.Config.Consumer == "" {
-		n.Logger.Error("consumer name not provided")
-		return errConsumerNotProvided
-	}
-
-	// Create a unique consumer name for each topic
-	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, topic)
-
-	// Create or update the consumer
-	cons, err := n.JetStream.CreateOrUpdateConsumer(ctx, n.Config.Stream.Stream, jetstream.ConsumerConfig{
-		Durable:       consumerName,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		FilterSubject: topic,
-		MaxDeliver:    n.Config.Stream.MaxDeliver,
-		DeliverPolicy: jetstream.DeliverNewPolicy,
-		AckWait:       30 * time.Second,
-	})
-	if err != nil {
-		n.Logger.Errorf("failed to create or update consumer: %v", err)
-		return err
-	}
-
-	// Start fetching messages
-	go n.startConsuming(ctx, cons, handler)
-
-	return nil
-}
-*/
-
 func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
 	n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_total_count", "topic", topic)
 
@@ -327,7 +296,10 @@ func (n *Client) createSubscription(ctx context.Context, topic string) error {
 		return errConsumerNotProvided
 	}
 
-	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, topic)
+	// convert the topic . to _ to create a valid durable consumer name
+	newTopic := strings.ReplaceAll(topic, ".", "_")
+
+	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, newTopic)
 
 	cons, err := n.JetStream.CreateOrUpdateConsumer(ctx, n.Config.Stream.Stream, jetstream.ConsumerConfig{
 		Durable:       consumerName,
