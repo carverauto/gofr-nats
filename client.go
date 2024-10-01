@@ -105,67 +105,18 @@ func (w *natsConnWrapper) NatsConn() *nats.Conn {
 	return w.Conn
 }
 
-// New creates and returns a new Client Client.
-/*
-func New(conf *Config, logger pubsub.Logger, metrics Metrics) (pubsub.Client, error) {
-	if err := ValidateConfigs(conf); err != nil {
-		logger.Errorf("could not initialize Client JetStream: %v", err)
-		return nil, err
-	}
-
-	logger.Debugf("connecting to Client server '%s'", conf.Server)
-
-	// Create connection options
-	opts := []nats.Option{nats.Name("GoFr Client JetStreamClient")}
-
-	// Add credentials if provided
-	if conf.CredsFile != "" {
-		opts = append(opts, nats.UserCredentials(conf.CredsFile))
-	}
-
-	nc, err := nats.Connect(conf.Server, opts...)
-	if err != nil {
-		logger.Errorf("failed to connect to Client server at %v: %v", conf.Server, err)
-		return nil, err
-	}
-
-	// Check connection status
-	status := nc.Status()
-	if status != nats.CONNECTED {
-		logger.Errorf("unexpected Client connection status: %v", status)
-		return nil, errConnectionStatus
-	}
-
-	js, err := jetstream.New(nc)
-	if err != nil {
-		logger.Errorf("failed to create JetStream context: %v", err)
-		return nil, err
-	}
-
-	logger.Logf("connected to Client server '%s'", conf.Server)
-
-	client := &Client{
-		Conn:          &natsConnWrapper{nc},
-		JetStream:     js,
-		Logger:        logger,
-		Config:        conf,
-		Metrics:       metrics,
-		Subscriptions: make(map[string]*subscription),
-	}
-
-	return &PubSubWrapper{Client: client}, nil
-}
-*/
-
-// New creates and returns a new Client.
+// New creates a new Client.
 func New(cfg *Config) *PubSubWrapper {
 	if cfg == nil {
-		cfg = &Config{} // Provide default config if nil
+		cfg = &Config{}
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = 100 // Default batch size
 	}
 	client := &Client{
 		Config:        cfg,
 		Subscriptions: make(map[string]*subscription),
-		messageBuffer: make(chan *pubsub.Message, cfg.BatchSize),
+		messageBuffer: make(chan *pubsub.Message, cfg.BatchSize*2), // Double the batch size for buffer
 		bufferSize:    cfg.BatchSize,
 	}
 	return &PubSubWrapper{Client: client}
@@ -268,21 +219,10 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		return nil, errors.New("JetStream is not configured")
 	}
 
-	n.subMu.Lock()
-	if n.Subscriptions == nil {
-		n.Subscriptions = make(map[string]*subscription)
-	}
-	n.subMu.Unlock()
-
-	n.subMu.Lock()
-	_, exists := n.Subscriptions[topic]
-	n.subMu.Unlock()
-
-	if !exists {
-		err := n.createSubscription(ctx, topic)
-		if err != nil {
-			return nil, err
-		}
+	// Ensure subscription exists
+	err := n.ensureSubscription(ctx, topic)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure subscription: %w", err)
 	}
 
 	// Use a timeout to avoid blocking indefinitely
@@ -294,8 +234,26 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic)
 		return msg, nil
 	case <-timeoutCtx.Done():
-		return nil, timeoutCtx.Err()
+		return nil, fmt.Errorf("timeout waiting for message: %w", timeoutCtx.Err())
 	}
+}
+
+func (n *Client) ensureSubscription(ctx context.Context, topic string) error {
+	n.subMu.Lock()
+	defer n.subMu.Unlock()
+
+	if n.Subscriptions == nil {
+		n.Subscriptions = make(map[string]*subscription)
+	}
+
+	if _, exists := n.Subscriptions[topic]; !exists {
+		err := n.createSubscription(ctx, topic)
+		if err != nil {
+			return fmt.Errorf("failed to create subscription: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (n *Client) createSubscription(ctx context.Context, topic string) error {
@@ -303,9 +261,7 @@ func (n *Client) createSubscription(ctx context.Context, topic string) error {
 		return errConsumerNotProvided
 	}
 
-	// convert the topic . to _ to create a valid durable consumer name
 	newTopic := strings.ReplaceAll(topic, ".", "_")
-
 	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, newTopic)
 
 	cons, err := n.JetStream.CreateOrUpdateConsumer(ctx, n.Config.Stream.Stream, jetstream.ConsumerConfig{
@@ -317,18 +273,50 @@ func (n *Client) createSubscription(ctx context.Context, topic string) error {
 		AckWait:       30 * time.Second,
 	})
 	if err != nil {
-		n.Logger.Errorf("failed to create or update consumer: %v", err)
-		return err
+		return fmt.Errorf("failed to create or update consumer: %w", err)
 	}
 
 	subCtx, cancel := context.WithCancel(context.Background())
-	n.subMu.Lock()
 	n.Subscriptions[topic] = &subscription{ctx: subCtx, cancel: cancel}
-	n.subMu.Unlock()
 
-	go n.startConsuming(subCtx, cons, topic)
+	go n.fetchMessages(subCtx, cons, topic)
 
 	return nil
+}
+
+func (n *Client) fetchMessages(ctx context.Context, cons jetstream.Consumer, topic string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msgs, err := cons.Fetch(n.bufferSize, jetstream.FetchMaxWait(n.Config.MaxWait))
+			if err != nil {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
+				}
+				time.Sleep(time.Second) // Wait before retrying
+				continue
+			}
+
+			for msg := range msgs.Messages() {
+				select {
+				case n.messageBuffer <- &pubsub.Message{
+					Topic:     topic,
+					Value:     msg.Data(),
+					MetaData:  msg.Headers(),
+					Committer: &natsCommitter{msg: msg},
+				}:
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			if err := msgs.Error(); err != nil {
+				n.Logger.Errorf("Error in message batch for topic %s: %v", topic, err)
+			}
+		}
+	}
 }
 
 func (n *Client) startConsuming(ctx context.Context, cons jetstream.Consumer, topic string) {
