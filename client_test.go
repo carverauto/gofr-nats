@@ -222,23 +222,18 @@ func TestNATSClient_SubscribeTimeout(t *testing.T) {
 		Logger:        logging.NewMockLogger(logging.DEBUG),
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
 
 	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_total_count", "topic", "test-subject")
 	mockJS.EXPECT().CreateOrUpdateConsumer(gomock.Any(), client.Config.Stream.Stream, gomock.Any()).Return(mockConsumer, nil)
-	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(_, _ interface{}) (jetstream.MessageBatch, error) {
-			time.Sleep(200 * time.Millisecond) // Sleep longer than MaxWait
-			return mockMsgBatch, context.DeadlineExceeded
-		},
-	)
+	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(mockMsgBatch, context.DeadlineExceeded)
 
-	// Call Subscribe
 	msg, err := client.Subscribe(ctx, "test-subject")
 
 	require.Error(t, err)
 	assert.Nil(t, msg)
-	assert.Equal(t, errTimeoutWaitingForMsg, err, "Expected errTimeoutWaitingForMsg error")
+	assert.Equal(t, errTimeoutWaitingForMsg, err)
 }
 
 func TestNATSClient_SubscribeError(t *testing.T) {

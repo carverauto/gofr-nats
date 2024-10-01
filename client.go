@@ -288,40 +288,37 @@ func (n *Client) fetchAndProcessMessage(ctx context.Context, cons jetstream.Cons
 
 	msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(n.Config.MaxWait))
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			n.Logger.Debugf("No message received for topic %s, continuing to listen", topic)
+
+			return nil, errTimeoutWaitingForMsg
+		}
+
 		return nil, n.handleFetchError(err, topic)
 	}
 
-	return n.processMessages(fetchCtx, msgs, topic)
+	select {
+	case msg := <-msgs.Messages():
+		if msg == nil {
+			return nil, errNoMsgReceivedForTopic
+		}
+
+		return n.handleReceivedMessage(msg, msgs, topic)
+	case <-fetchCtx.Done():
+		return nil, errTimeoutWaitingForMsg
+	}
 }
 
 func (n *Client) handleFetchError(err error, topic string) error {
 	if errors.Is(err, context.DeadlineExceeded) {
 		n.Logger.Debugf("Timeout waiting for message on topic %s", topic)
+
 		return errTimeoutWaitingForMsg
 	}
 
 	n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
 
 	return errFetchMsgError
-}
-
-func (n *Client) handleContextDone(ctx context.Context, topic string) error {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		n.Logger.Debugf("Timeout waiting for message on topic %s", topic)
-
-		return errTimeoutWaitingForMsg
-	}
-
-	return errFetchMsgError
-}
-
-func (n *Client) processMessages(ctx context.Context, msgs jetstream.MessageBatch, topic string) (*pubsub.Message, error) {
-	select {
-	case msg := <-msgs.Messages():
-		return n.handleReceivedMessage(msg, msgs, topic)
-	case <-ctx.Done():
-		return nil, n.handleContextDone(ctx, topic)
-	}
 }
 
 func (n *Client) handleReceivedMessage(msg jetstream.Msg, msgs jetstream.MessageBatch, topic string) (*pubsub.Message, error) {
