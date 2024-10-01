@@ -265,8 +265,15 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 	n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_total_count", "topic", topic)
 
 	if n.JetStream == nil {
-		return nil, errors.New("JetStream not initialized")
+		return nil, errors.New("JetStream is not configured")
 	}
+
+	// Initialize Subscriptions map if it's nil
+	n.subMu.Lock()
+	if n.Subscriptions == nil {
+		n.Subscriptions = make(map[string]*subscription)
+	}
+	n.subMu.Unlock()
 
 	// Check if we already have a subscription for this topic
 	n.subMu.Lock()

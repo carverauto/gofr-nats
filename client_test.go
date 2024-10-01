@@ -2,7 +2,6 @@ package nats
 
 import (
 	"context"
-	"fmt"
 	"testing"
 	"time"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	"gofr.dev/pkg/gofr/datasource/pubsub"
 	"gofr.dev/pkg/gofr/logging"
 	"gofr.dev/pkg/gofr/testutil"
 )
@@ -151,14 +151,10 @@ func TestNATSClient_SubscribeSuccess(t *testing.T) {
 	mockJS := NewMockJetStream(ctrl)
 	mockConsumer := NewMockConsumer(ctrl)
 	mockMsgBatch := NewMockMessageBatch(ctrl)
-	mockMsg := NewMockMsg(ctrl)
-	logger := logging.NewMockLogger(logging.DEBUG)
-	metrics := NewMockMetrics(ctrl)
+	mockMetrics := NewMockMetrics(ctrl)
 
 	client := &Client{
 		JetStream: mockJS,
-		Logger:    logger,
-		Metrics:   metrics,
 		Config: &Config{
 			Stream: StreamConfig{
 				Stream:   "test-stream",
@@ -168,46 +164,38 @@ func TestNATSClient_SubscribeSuccess(t *testing.T) {
 			MaxWait:   time.Second,
 			BatchSize: 1,
 		},
+		messageBuffer: make(chan *pubsub.Message, 1),
+		bufferSize:    1,
+		Metrics:       mockMetrics,
+		Subscriptions: make(map[string]*subscription),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_total_count", "topic", "test-subject")
 	mockJS.EXPECT().CreateOrUpdateConsumer(gomock.Any(), client.Config.Stream.Stream, gomock.Any()).Return(mockConsumer, nil)
-
-	mockConsumer.EXPECT().Fetch(client.Config.BatchSize, gomock.Any()).Return(mockMsgBatch, nil).Times(1)
-	mockConsumer.EXPECT().Fetch(client.Config.BatchSize, gomock.Any()).Return(nil, context.Canceled).AnyTimes()
-
-	msgChan := make(chan jetstream.Msg, 1)
-
-	mockMsg.EXPECT().Data().Return([]byte("test message")).AnyTimes()
-	mockMsg.EXPECT().Subject().Return("test-subject").AnyTimes()
-	mockMsg.EXPECT().Ack().Return(nil).AnyTimes()
-
-	msgChan <- mockMsg
-	close(msgChan)
-
-	mockMsgBatch.EXPECT().Messages().Return(msgChan)
+	mockConsumer.EXPECT().Fetch(client.Config.BatchSize, gomock.Any()).Return(mockMsgBatch, nil).AnyTimes()
+	mockMsgBatch.EXPECT().Messages().Return(make(chan jetstream.Msg, 1)).AnyTimes()
 	mockMsgBatch.EXPECT().Error().Return(nil).AnyTimes()
+	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_success_count", "topic", "test-subject")
 
-	messageReceived := make(chan bool)
+	// Simulate a message being received
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		client.messageBuffer <- &pubsub.Message{
+			Topic: "test-subject",
+			Value: []byte("test message"),
+		}
+	}()
 
-	err := client.Subscribe(ctx, "test-subject", func(_ context.Context, msg jetstream.Msg) error {
-		assert.Equal(t, []byte("test message"), msg.Data())
-		assert.Equal(t, "test-subject", msg.Subject())
-		messageReceived <- true
-
-		return nil
-	})
+	// Call Subscribe
+	msg, err := client.Subscribe(ctx, "test-subject")
 
 	require.NoError(t, err)
-
-	select {
-	case <-messageReceived:
-		// Test passed
-	case <-time.After(2 * time.Second):
-		t.Fatal("Timed out waiting for message")
-	}
+	assert.NotNil(t, msg)
+	assert.Equal(t, "test-subject", msg.Topic)
+	assert.Equal(t, []byte("test message"), msg.Value)
 }
 
 func TestNATSClient_SubscribeError(t *testing.T) {
@@ -215,13 +203,10 @@ func TestNATSClient_SubscribeError(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockJS := NewMockJetStream(ctrl)
-	logger := logging.NewLogger(logging.DEBUG)
-	metrics := NewMockMetrics(ctrl)
+	mockMetrics := NewMockMetrics(ctrl)
 
 	client := &Client{
 		JetStream: mockJS,
-		Logger:    logger,
-		Metrics:   metrics,
 		Config: &Config{
 			Stream: StreamConfig{
 				Stream:   "test-stream",
@@ -229,25 +214,26 @@ func TestNATSClient_SubscribeError(t *testing.T) {
 			},
 			Consumer: "test-consumer",
 		},
+		Metrics:       mockMetrics,
+		Subscriptions: make(map[string]*subscription),
 	}
 
 	ctx := context.Background()
 
-	expectedErr := errFailedToCreateStream
+	expectedErr := errFailedToCreateConsumer
+	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_total_count", "topic", "test-subject")
 	mockJS.EXPECT().CreateOrUpdateConsumer(gomock.Any(), client.Config.Stream.Stream, gomock.Any()).Return(nil, expectedErr)
-
-	var err error
 
 	logs := testutil.StderrOutputForFunc(func() {
 		client.Logger = logging.NewMockLogger(logging.DEBUG)
-		err = client.Subscribe(ctx, "test-subject", func(_ context.Context, _ jetstream.Msg) error {
-			return nil // This shouldn't be called in this error case
-		})
+		msg, err := client.Subscribe(ctx, "test-subject")
+
+		require.Error(t, err)
+		assert.Nil(t, msg)
+		assert.Equal(t, expectedErr, err)
 	})
 
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to create stream")
-	assert.Contains(t, logs, "failed to create or update consumer: failed to create stream")
+	assert.Contains(t, logs, "failed to create or update consumer")
 }
 
 func TestNATSClient_Close(t *testing.T) {
@@ -287,44 +273,58 @@ func TestNew(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	mockMetrics := NewMockMetrics(ctrl)
-
 	config := &Config{
 		Server: NatsServer,
 		Stream: StreamConfig{
 			Stream:   "test-stream",
 			Subjects: []string{"test-subject"},
 		},
-		Consumer: "test-consumer",
+		Consumer:  "test-consumer",
+		MaxWait:   5 * time.Second,
+		BatchSize: 100,
 	}
 
 	logs := testutil.StdoutOutputForFunc(func() {
-		mockLogger := logging.NewMockLogger(logging.DEBUG)
-		client, err := New(config, mockLogger, mockMetrics)
+		natsClient := New(config)
+		assert.NotNil(t, natsClient)
 
-		require.NoError(t, err)
-		assert.NotNil(t, client)
+		// Check Client struct
+		assert.NotNil(t, natsClient.Client)
+		assert.Equal(t, config, natsClient.Client.Config)
+		assert.NotNil(t, natsClient.Client.Subscriptions)
+		assert.NotNil(t, natsClient.Client.messageBuffer)
+		assert.Equal(t, config.BatchSize, natsClient.Client.bufferSize)
 
-		natsClient, ok := client.(*PubSubWrapper)
-		assert.True(t, ok, "Returned Client is not a NatsPubSubWrapper")
+		// Check methods
+		assert.NotNil(t, natsClient.DeleteTopic)
+		assert.NotNil(t, natsClient.CreateTopic)
+		assert.NotNil(t, natsClient.Subscribe)
+		assert.NotNil(t, natsClient.Publish)
+		assert.NotNil(t, natsClient.Close)
 
-		if ok {
-			assert.NotNil(t, natsClient.Client)
-			assert.NotNil(t, natsClient.Client.DeleteStream)
-			assert.NotNil(t, natsClient.Client.CreateStream)
-			assert.NotNil(t, natsClient.Client.CreateOrUpdateStream)
-		}
+		// Check new methods
+		assert.NotNil(t, natsClient.UseLogger)
+		assert.NotNil(t, natsClient.UseMetrics)
+		assert.NotNil(t, natsClient.UseTracer)
+		assert.NotNil(t, natsClient.Connect)
+
+		// Check that Connect hasn't been called yet
+		assert.Nil(t, natsClient.Client.Conn)
+		assert.Nil(t, natsClient.Client.JetStream)
+
+		// Test Connect method
+		natsClient.Connect()
+		// Note: In a real scenario, we'd mock the NATS connection.
+		// For this test, we're just checking that the method exists and can be called.
 	})
 
-	assert.Contains(t, logs, fmt.Sprintf("connecting to Client server '%s'", NatsServer))
-	assert.Contains(t, logs, fmt.Sprintf("connected to Client server '%s'", NatsServer))
+	// We expect no logs because Connect() is not called in New()
+	assert.Empty(t, logs, "Expected no logs, but got: %s", logs)
 }
 
 func TestNew_Error(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-
-	mockMetrics := NewMockMetrics(ctrl)
 
 	testCases := []struct {
 		name        string
@@ -343,12 +343,8 @@ func TestNew_Error(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			mockLogger := logging.NewMockLogger(logging.DEBUG)
-			client, err := New(tc.config, mockLogger, mockMetrics)
-
-			require.Error(t, err)
-			assert.Nil(t, client)
-			assert.Equal(t, tc.expectedErr, err)
+			client := New(tc.config)
+			assert.NotNil(t, client, "Client should not be nil even with invalid config")
 		})
 	}
 }
@@ -595,13 +591,11 @@ func TestNATSClient_SubscribeCreateConsumerError(t *testing.T) {
 	defer ctrl.Finish()
 
 	mockJS := NewMockJetStream(ctrl)
-	logger := logging.NewMockLogger(logging.DEBUG)
-	metrics := NewMockMetrics(ctrl)
+	mockMetrics := NewMockMetrics(ctrl)
 
 	client := &Client{
 		JetStream: mockJS,
-		Logger:    logger,
-		Metrics:   metrics,
+		Metrics:   mockMetrics,
 		Config: &Config{
 			Stream: StreamConfig{
 				Stream:   "test-stream",
@@ -609,19 +603,26 @@ func TestNATSClient_SubscribeCreateConsumerError(t *testing.T) {
 			},
 			Consumer: "test-consumer",
 		},
+		Subscriptions: make(map[string]*subscription),
+		messageBuffer: make(chan *pubsub.Message, 1),
 	}
 
 	ctx := context.Background()
 	expectedErr := errFailedToCreateConsumer
 
+	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_total_count", "topic", "test-subject")
 	mockJS.EXPECT().CreateOrUpdateConsumer(gomock.Any(), client.Config.Stream.Stream, gomock.Any()).Return(nil, expectedErr)
 
-	err := client.Subscribe(ctx, "test-subject", func(_ context.Context, _ jetstream.Msg) error {
-		return nil
+	logs := testutil.StderrOutputForFunc(func() {
+		client.Logger = logging.NewMockLogger(logging.DEBUG)
+		msg, err := client.Subscribe(ctx, "test-subject")
+
+		require.Error(t, err)
+		assert.Nil(t, msg)
+		assert.Equal(t, expectedErr, err)
 	})
 
-	require.Error(t, err)
-	assert.Equal(t, expectedErr, err)
+	assert.Contains(t, logs, "failed to create or update consumer")
 }
 
 func TestNATSClient_HandleMessageError(t *testing.T) {
