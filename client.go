@@ -53,6 +53,8 @@ type Client struct {
 	Subscriptions map[string]*subscription
 	subMu         sync.Mutex
 	Tracer        trace.Tracer
+	messageBuffer chan *pubsub.Message
+	bufferSize    int
 }
 
 // CreateTopic creates a new topic (stream) in Client JetStream.
@@ -159,6 +161,8 @@ func New(cfg *Config) *Client {
 	return &Client{
 		Config:        cfg,
 		Subscriptions: make(map[string]*subscription),
+		messageBuffer: make(chan *pubsub.Message, cfg.BatchSize),
+		bufferSize:    cfg.BatchSize,
 	}
 }
 
@@ -240,6 +244,7 @@ func (n *Client) Publish(ctx context.Context, subject string, message []byte) er
 }
 
 // Subscribe subscribes to a topic.
+/*
 func (n *Client) Subscribe(ctx context.Context, topic string, handler messageHandler) error {
 	if n.Config.Consumer == "" {
 		n.Logger.Error("consumer name not provided")
@@ -268,26 +273,101 @@ func (n *Client) Subscribe(ctx context.Context, topic string, handler messageHan
 
 	return nil
 }
+*/
 
-func (n *Client) startConsuming(ctx context.Context, cons jetstream.Consumer, handler messageHandler) {
+func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
+	n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_total_count", "topic", topic)
+
+	if n.JetStream == nil {
+		return nil, errors.New("JetStream not initialized")
+	}
+
+	// Check if we already have a subscription for this topic
+	n.subMu.Lock()
+	_, exists := n.Subscriptions[topic]
+	n.subMu.Unlock()
+
+	if !exists {
+		// If not, create a new subscription
+		err := n.createSubscription(ctx, topic)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Wait for a message from the buffer
+	select {
+	case msg := <-n.messageBuffer:
+		n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic)
+		return msg, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (n *Client) createSubscription(ctx context.Context, topic string) error {
+	if n.Config.Consumer == "" {
+		return errConsumerNotProvided
+	}
+
+	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, topic)
+
+	cons, err := n.JetStream.CreateOrUpdateConsumer(ctx, n.Config.Stream.Stream, jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: topic,
+		MaxDeliver:    n.Config.Stream.MaxDeliver,
+		DeliverPolicy: jetstream.DeliverNewPolicy,
+		AckWait:       30 * time.Second,
+	})
+	if err != nil {
+		n.Logger.Errorf("failed to create or update consumer: %v", err)
+		return err
+	}
+
+	subCtx, cancel := context.WithCancel(context.Background())
+	n.subMu.Lock()
+	n.Subscriptions[topic] = &subscription{ctx: subCtx, cancel: cancel}
+	n.subMu.Unlock()
+
+	go n.startConsuming(subCtx, cons, topic)
+
+	return nil
+}
+
+func (n *Client) startConsuming(ctx context.Context, cons jetstream.Consumer, topic string) {
 	for {
-		if err := n.fetchAndProcessMessages(ctx, cons, handler); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if err := n.fetchAndProcessMessages(ctx, cons, topic); err != nil {
+				n.HandleFetchError(err)
 			}
-
-			n.HandleFetchError(err)
 		}
 	}
 }
 
-func (n *Client) fetchAndProcessMessages(ctx context.Context, cons jetstream.Consumer, handler messageHandler) error {
-	msgs, err := cons.Fetch(n.Config.BatchSize, jetstream.FetchMaxWait(n.Config.MaxWait))
+func (n *Client) fetchAndProcessMessages(ctx context.Context, cons jetstream.Consumer, topic string) error {
+	msgs, err := cons.Fetch(n.bufferSize, jetstream.FetchMaxWait(n.Config.MaxWait))
 	if err != nil {
 		return err
 	}
 
-	n.processMessages(ctx, msgs, handler)
+	for msg := range msgs.Messages() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			pubsubMsg := &pubsub.Message{
+				Topic:     topic,
+				Value:     msg.Data(),
+				MetaData:  msg.Headers(), // Using Headers as MetaData
+				Committer: &natsCommitter{msg: msg},
+			}
+			n.messageBuffer <- pubsubMsg
+		}
+	}
 
 	return msgs.Error()
 }
