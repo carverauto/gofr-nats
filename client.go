@@ -219,23 +219,58 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		return nil, errors.New("JetStream is not configured")
 	}
 
-	// Ensure subscription exists
-	err := n.ensureSubscription(ctx, topic)
+	if n.Config.Consumer == "" {
+		return nil, errors.New("consumer name not provided")
+	}
+
+	// Create a unique consumer name for each topic
+	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, strings.ReplaceAll(topic, ".", "_"))
+
+	// Create or update the consumer
+	cons, err := n.JetStream.CreateOrUpdateConsumer(ctx, n.Config.Stream.Stream, jetstream.ConsumerConfig{
+		Durable:       consumerName,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: topic,
+		MaxDeliver:    n.Config.Stream.MaxDeliver,
+		DeliverPolicy: jetstream.DeliverNewPolicy,
+		AckWait:       30 * time.Second,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to ensure subscription: %w", err)
+		n.Logger.Errorf("failed to create or update consumer: %v", err)
+		return nil, err
 	}
 
-	// Use a longer timeout to avoid frequent timeouts
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	select {
-	case msg := <-n.messageBuffer:
-		n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic)
-		return msg, nil
-	case <-timeoutCtx.Done():
-		return nil, fmt.Errorf("timeout waiting for message: %w", timeoutCtx.Err())
+	// Fetch a single message
+	msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(n.Config.MaxWait))
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			n.Logger.Debugf("No messages available for topic %s", topic)
+			return nil, nil // No messages available
+		}
+		n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
+		return nil, err
 	}
+
+	msg := <-msgs.Messages()
+	if msg == nil {
+		n.Logger.Debugf("No messages received for topic %s", topic)
+		return nil, nil
+	}
+
+	// Check for any error in the message batch
+	if fetchErr := msgs.Error(); fetchErr != nil {
+		n.Logger.Errorf("Error in message batch for topic %s: %v", topic, fetchErr)
+		return nil, fetchErr
+	}
+
+	n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic)
+
+	return &pubsub.Message{
+		Topic:     topic,
+		Value:     msg.Data(),
+		MetaData:  msg.Headers(),
+		Committer: &natsCommitter{msg: msg},
+	}, nil
 }
 
 func (n *Client) ensureSubscription(ctx context.Context, topic string) error {
@@ -293,7 +328,7 @@ func (n *Client) fetchMessages(ctx context.Context, cons jetstream.Consumer, top
 			n.Logger.Debugf("Fetching messages for topic %s", topic)
 			msgs, err := cons.Fetch(n.bufferSize, jetstream.FetchMaxWait(n.Config.MaxWait))
 			if err != nil {
-				if err != context.DeadlineExceeded {
+				if !errors.Is(err, context.DeadlineExceeded) {
 					n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
 				} else {
 					n.Logger.Debugf("No messages available for topic %s", topic)
