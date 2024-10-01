@@ -268,33 +268,33 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		return nil, errors.New("JetStream is not configured")
 	}
 
-	// Initialize Subscriptions map if it's nil
 	n.subMu.Lock()
 	if n.Subscriptions == nil {
 		n.Subscriptions = make(map[string]*subscription)
 	}
 	n.subMu.Unlock()
 
-	// Check if we already have a subscription for this topic
 	n.subMu.Lock()
 	_, exists := n.Subscriptions[topic]
 	n.subMu.Unlock()
 
 	if !exists {
-		// If not, create a new subscription
 		err := n.createSubscription(ctx, topic)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	// Wait for a message from the buffer
+	// Use a timeout to avoid blocking indefinitely
+	timeoutCtx, cancel := context.WithTimeout(ctx, n.Config.MaxWait)
+	defer cancel()
+
 	select {
 	case msg := <-n.messageBuffer:
 		n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic)
 		return msg, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	case <-timeoutCtx.Done():
+		return nil, timeoutCtx.Err()
 	}
 }
 
@@ -347,6 +347,7 @@ func (n *Client) startConsuming(ctx context.Context, cons jetstream.Consumer, to
 func (n *Client) fetchAndProcessMessages(ctx context.Context, cons jetstream.Consumer, topic string) error {
 	msgs, err := cons.Fetch(n.bufferSize, jetstream.FetchMaxWait(n.Config.MaxWait))
 	if err != nil {
+		n.Logger.Errorf("Error fetching messages: %v", err)
 		return err
 	}
 
@@ -355,10 +356,11 @@ func (n *Client) fetchAndProcessMessages(ctx context.Context, cons jetstream.Con
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			n.Logger.Debugf("Received message on topic '%s': %s", topic, string(msg.Data()))
 			pubsubMsg := &pubsub.Message{
 				Topic:     topic,
 				Value:     msg.Data(),
-				MetaData:  msg.Headers(), // Using Headers as MetaData
+				MetaData:  msg.Headers(),
 				Committer: &natsCommitter{msg: msg},
 			}
 			n.messageBuffer <- pubsubMsg
@@ -479,4 +481,12 @@ func ValidateConfigs(conf *Config) error {
 	}
 
 	return err
+}
+
+// AckMessage acknowledges a message.
+func (n *Client) AckMessage(msg *pubsub.Message) error {
+	if natsMsg, ok := msg.Committer.(*natsCommitter); ok {
+		return natsMsg.msg.Ack()
+	}
+	return errors.New("invalid message committer")
 }
