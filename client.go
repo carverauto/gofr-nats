@@ -188,10 +188,11 @@ func (n *Client) UseMetrics(metrics any) {
 }
 
 // Connect establishes a connection to NATS and sets up JetStream.
-func (n *Client) Connect() error {
+// Connect establishes a connection to NATS and sets up JetStream.
+func (n *Client) Connect() {
 	if err := ValidateConfigs(n.Config); err != nil {
 		n.Logger.Errorf("could not initialize NATS JetStream: %v", err)
-		return err
+		return
 	}
 
 	opts := []nats.Option{nats.Name("GoFr NATS JetStreamClient")}
@@ -202,22 +203,20 @@ func (n *Client) Connect() error {
 	nc, err := nats.Connect(n.Config.Server, opts...)
 	if err != nil {
 		n.Logger.Errorf("failed to connect to NATS server at %v: %v", n.Config.Server, err)
-		return err
+		return
 	}
 
 	js, err := jetstream.New(nc)
 	if err != nil {
 		nc.Close()
 		n.Logger.Errorf("failed to create JetStream context: %v", err)
-		return err
+		return
 	}
 
 	n.Conn = &natsConnWrapper{nc}
 	n.JetStream = js
 
 	n.Logger.Logf("connected to NATS server '%s'", n.Config.Server)
-
-	return nil
 }
 
 // Publish publishes a message to a topic.
