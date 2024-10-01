@@ -4,8 +4,7 @@ import "errors"
 
 var (
 	// Client Errors.
-	errConnectionStatus           = errors.New("unexpected Client connection status")
-	errServerNotProvided          = errors.New("Client server address not provided")
+	errServerNotProvided          = errors.New("client server address not provided")
 	errSubjectsNotProvided        = errors.New("subjects not provided")
 	errConsumerNotProvided        = errors.New("consumer name not provided")
 	errFailedToCreateStream       = errors.New("failed to create stream")
@@ -15,7 +14,11 @@ var (
 	errFailedCreateOrUpdateStream = errors.New("create or update stream error")
 	errJetStreamNotConfigured     = errors.New("JetStream is not configured")
 	errJetStream                  = errors.New("JetStream error")
+	errNATSConnNil                = errors.New("NATS connection is nil")
 
 	// Message Errors.
-	errHandlerError = errors.New("handler error")
+	errHandlerError          = errors.New("handler error")
+	errNoMsgReceivedForTopic = errors.New("no message received for topic")
+	errTimeoutWaitingForMsg  = errors.New("timeout waiting for message")
+	errFetchMsgError         = errors.New("fetch message error")
 )

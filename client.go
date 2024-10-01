@@ -37,9 +37,7 @@ type StreamConfig struct {
 
 // subscription holds subscription information for Client JetStream.
 type subscription struct {
-	handler messageHandler
-	ctx     context.Context
-	cancel  context.CancelFunc
+	cancel context.CancelFunc
 }
 
 type messageHandler func(context.Context, jetstream.Msg) error
@@ -110,15 +108,18 @@ func New(cfg *Config) *PubSubWrapper {
 	if cfg == nil {
 		cfg = &Config{}
 	}
+
 	if cfg.BatchSize == 0 {
 		cfg.BatchSize = 100 // Default batch size
 	}
+
 	client := &Client{
 		Config:        cfg,
 		Subscriptions: make(map[string]*subscription),
-		messageBuffer: make(chan *pubsub.Message, cfg.BatchSize*2), // Double the batch size for buffer
+		messageBuffer: make(chan *pubsub.Message, cfg.BatchSize),
 		bufferSize:    cfg.BatchSize,
 	}
+
 	return &PubSubWrapper{Client: client}
 }
 
@@ -145,20 +146,42 @@ func (n *Client) UseMetrics(metrics any) {
 
 // Connect establishes a connection to NATS and sets up JetStream.
 func (n *Client) Connect() {
-	if n.Config == nil {
-		if n.Logger != nil {
-			n.Logger.Error("NATS configuration is nil")
-		}
+	if err := n.validateAndPrepare(); err != nil {
 		return
+	}
+
+	nc, err := n.createNATSConnection()
+	if err != nil {
+		return
+	}
+
+	js, err := n.createJetStreamContext(nc)
+	if err != nil {
+		nc.Close()
+		return
+	}
+
+	n.Conn = &natsConnWrapper{nc}
+	n.JetStream = js
+
+	n.logSuccessfulConnection()
+}
+
+func (n *Client) validateAndPrepare() error {
+	if n.Config == nil {
+		n.Logger.Errorf("NATS configuration is nil")
+		return errNATSConnNil
 	}
 
 	if err := ValidateConfigs(n.Config); err != nil {
-		if n.Logger != nil {
-			n.Logger.Errorf("could not initialize NATS JetStream: %v", err)
-		}
-		return
+		n.Logger.Errorf("could not initialize NATS JetStream: %v", err)
+		return err
 	}
 
+	return nil
+}
+
+func (n *Client) createNATSConnection() (*nats.Conn, error) {
 	opts := []nats.Option{nats.Name("GoFr NATS JetStreamClient")}
 	if n.Config.CredsFile != "" {
 		opts = append(opts, nats.UserCredentials(n.Config.CredsFile))
@@ -166,24 +189,24 @@ func (n *Client) Connect() {
 
 	nc, err := nats.Connect(n.Config.Server, opts...)
 	if err != nil {
-		if n.Logger != nil {
-			n.Logger.Errorf("failed to connect to NATS server at %v: %v", n.Config.Server, err)
-		}
-		return
+		n.Logger.Errorf("failed to connect to NATS server at %v: %v", n.Config.Server, err)
+		return nil, err
 	}
 
+	return nc, nil
+}
+
+func (n *Client) createJetStreamContext(nc *nats.Conn) (jetstream.JetStream, error) {
 	js, err := jetstream.New(nc)
 	if err != nil {
-		nc.Close()
-		if n.Logger != nil {
-			n.Logger.Errorf("failed to create JetStream context: %v", err)
-		}
-		return
+		n.Logger.Errorf("failed to create JetStream context: %v", err)
+		return nil, err
 	}
 
-	n.Conn = &natsConnWrapper{nc}
-	n.JetStream = js
+	return js, nil
+}
 
+func (n *Client) logSuccessfulConnection() {
 	if n.Logger != nil {
 		n.Logger.Logf("connected to NATS server '%s'", n.Config.Server)
 	}
@@ -215,18 +238,32 @@ func (n *Client) Publish(ctx context.Context, subject string, message []byte) er
 func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
 	n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_total_count", "topic", topic)
 
+	if err := n.validateSubscribePrerequisites(); err != nil {
+		return nil, err
+	}
+
+	cons, err := n.createOrUpdateConsumer(ctx, topic)
+	if err != nil {
+		return nil, err
+	}
+
+	return n.fetchAndProcessMessage(ctx, cons, topic)
+}
+
+func (n *Client) validateSubscribePrerequisites() error {
 	if n.JetStream == nil {
-		return nil, errors.New("JetStream is not configured")
+		return errJetStreamNotConfigured
 	}
 
 	if n.Config.Consumer == "" {
-		return nil, errors.New("consumer name not provided")
+		return errConsumerNotProvided
 	}
 
-	// Create a unique consumer name for each topic
-	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, strings.ReplaceAll(topic, ".", "_"))
+	return nil
+}
 
-	// Create or update the consumer
+func (n *Client) createOrUpdateConsumer(ctx context.Context, topic string) (jetstream.Consumer, error) {
+	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, strings.ReplaceAll(topic, ".", "_"))
 	cons, err := n.JetStream.CreateOrUpdateConsumer(ctx, n.Config.Stream.Stream, jetstream.ConsumerConfig{
 		Durable:       consumerName,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -235,35 +272,72 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		DeliverPolicy: jetstream.DeliverNewPolicy,
 		AckWait:       30 * time.Second,
 	})
+
 	if err != nil {
 		n.Logger.Errorf("failed to create or update consumer: %v", err)
+
 		return nil, err
 	}
 
-	// Fetch a single message
+	return cons, nil
+}
+
+func (n *Client) fetchAndProcessMessage(ctx context.Context, cons jetstream.Consumer, topic string) (*pubsub.Message, error) {
+	fetchCtx, cancel := context.WithTimeout(ctx, n.Config.MaxWait)
+	defer cancel()
+
 	msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(n.Config.MaxWait))
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			n.Logger.Debugf("No messages available for topic %s", topic)
-			return nil, nil // No messages available
-		}
-		n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
-		return nil, err
+		return nil, n.handleFetchError(err, topic)
 	}
 
-	msg := <-msgs.Messages()
+	return n.processMessages(fetchCtx, msgs, topic)
+}
+
+func (n *Client) handleFetchError(err error, topic string) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		n.Logger.Debugf("Timeout waiting for message on topic %s", topic)
+		return errTimeoutWaitingForMsg
+	}
+
+	n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
+
+	return errFetchMsgError
+}
+
+func (n *Client) handleContextDone(ctx context.Context, topic string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		n.Logger.Debugf("Timeout waiting for message on topic %s", topic)
+
+		return errTimeoutWaitingForMsg
+	}
+
+	return errFetchMsgError
+}
+
+func (n *Client) processMessages(ctx context.Context, msgs jetstream.MessageBatch, topic string) (*pubsub.Message, error) {
+	select {
+	case msg := <-msgs.Messages():
+		return n.handleReceivedMessage(msg, msgs, topic)
+	case <-ctx.Done():
+		return nil, n.handleContextDone(ctx, topic)
+	}
+}
+
+func (n *Client) handleReceivedMessage(msg jetstream.Msg, msgs jetstream.MessageBatch, topic string) (*pubsub.Message, error) {
 	if msg == nil {
 		n.Logger.Debugf("No messages received for topic %s", topic)
-		return nil, nil
+
+		return nil, errNoMsgReceivedForTopic
 	}
 
-	// Check for any error in the message batch
 	if fetchErr := msgs.Error(); fetchErr != nil {
 		n.Logger.Errorf("Error in message batch for topic %s: %v", topic, fetchErr)
+
 		return nil, fetchErr
 	}
 
-	n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic)
+	n.Metrics.IncrementCounter(context.Background(), "app_pubsub_subscribe_success_count", "topic", topic)
 
 	return &pubsub.Message{
 		Topic:     topic,
@@ -273,144 +347,11 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 	}, nil
 }
 
-func (n *Client) ensureSubscription(ctx context.Context, topic string) error {
-	n.subMu.Lock()
-	defer n.subMu.Unlock()
-
-	if n.Subscriptions == nil {
-		n.Subscriptions = make(map[string]*subscription)
-	}
-
-	if _, exists := n.Subscriptions[topic]; !exists {
-		err := n.createSubscription(ctx, topic)
-		if err != nil {
-			return fmt.Errorf("failed to create subscription: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (n *Client) createSubscription(ctx context.Context, topic string) error {
-	if n.Config.Consumer == "" {
-		return errConsumerNotProvided
-	}
-
-	newTopic := strings.ReplaceAll(topic, ".", "_")
-	consumerName := fmt.Sprintf("%s_%s", n.Config.Consumer, newTopic)
-
-	cons, err := n.JetStream.CreateOrUpdateConsumer(ctx, n.Config.Stream.Stream, jetstream.ConsumerConfig{
-		Durable:       consumerName,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		FilterSubject: topic,
-		MaxDeliver:    n.Config.Stream.MaxDeliver,
-		DeliverPolicy: jetstream.DeliverNewPolicy,
-		AckWait:       30 * time.Second,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create or update consumer: %w", err)
-	}
-
-	subCtx, cancel := context.WithCancel(context.Background())
-	n.Subscriptions[topic] = &subscription{ctx: subCtx, cancel: cancel}
-
-	go n.fetchMessages(subCtx, cons, topic)
-
-	return nil
-}
-
-func (n *Client) fetchMessages(ctx context.Context, cons jetstream.Consumer, topic string) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			n.Logger.Debugf("Fetching messages for topic %s", topic)
-			msgs, err := cons.Fetch(n.bufferSize, jetstream.FetchMaxWait(n.Config.MaxWait))
-			if err != nil {
-				if !errors.Is(err, context.DeadlineExceeded) {
-					n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
-				} else {
-					n.Logger.Debugf("No messages available for topic %s", topic)
-				}
-				time.Sleep(time.Second) // Wait before retrying
-				continue
-			}
-
-			for msg := range msgs.Messages() {
-				n.Logger.Debugf("Received message for topic %s", topic)
-				select {
-				case n.messageBuffer <- &pubsub.Message{
-					Topic:     topic,
-					Value:     msg.Data(),
-					MetaData:  msg.Headers(),
-					Committer: &natsCommitter{msg: msg},
-				}:
-					n.Logger.Debugf("Buffered message for topic %s", topic)
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			if err := msgs.Error(); err != nil {
-				n.Logger.Errorf("Error in message batch for topic %s: %v", topic, err)
-			}
-		}
-	}
-}
-
-func (n *Client) startConsuming(ctx context.Context, cons jetstream.Consumer, topic string) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			if err := n.fetchAndProcessMessages(ctx, cons, topic); err != nil {
-				n.HandleFetchError(err)
-			}
-		}
-	}
-}
-
-func (n *Client) fetchAndProcessMessages(ctx context.Context, cons jetstream.Consumer, topic string) error {
-	msgs, err := cons.Fetch(n.bufferSize, jetstream.FetchMaxWait(n.Config.MaxWait))
-	if err != nil {
-		n.Logger.Errorf("Error fetching messages: %v", err)
-		return err
-	}
-
-	for msg := range msgs.Messages() {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			n.Logger.Debugf("Received message on topic '%s': %s", topic, string(msg.Data()))
-			pubsubMsg := &pubsub.Message{
-				Topic:     topic,
-				Value:     msg.Data(),
-				MetaData:  msg.Headers(),
-				Committer: &natsCommitter{msg: msg},
-			}
-			n.messageBuffer <- pubsubMsg
-		}
-	}
-
-	return msgs.Error()
-}
-
-// processMessages processes messages from a consumer.
-func (n *Client) processMessages(ctx context.Context, msgs jetstream.MessageBatch, handler messageHandler) {
-	for msg := range msgs.Messages() {
-		if err := n.HandleMessage(ctx, msg, handler); err != nil {
-			n.Logger.Errorf("error handling message: %v", err)
-		}
-	}
-}
-
 // HandleMessage handles a message from a consumer.
 func (n *Client) HandleMessage(ctx context.Context, msg jetstream.Msg, handler messageHandler) error {
 	if err := handler(ctx, msg); err != nil {
 		n.Logger.Errorf("error handling message: %v", err)
+
 		return n.NakMessage(msg)
 	}
 
@@ -509,12 +450,4 @@ func ValidateConfigs(conf *Config) error {
 	}
 
 	return err
-}
-
-// AckMessage acknowledges a message.
-func (n *Client) AckMessage(msg *pubsub.Message) error {
-	if natsMsg, ok := msg.Committer.(*natsCommitter); ok {
-		return natsMsg.msg.Ack()
-	}
-	return errors.New("invalid message committer")
 }
