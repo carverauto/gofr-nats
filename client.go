@@ -9,6 +9,7 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel/trace"
 	"gofr.dev/pkg/gofr/datasource/pubsub"
 )
 
@@ -51,6 +52,7 @@ type Client struct {
 	Metrics       Metrics
 	Subscriptions map[string]*subscription
 	subMu         sync.Mutex
+	Tracer        trace.Tracer
 }
 
 // CreateTopic creates a new topic (stream) in Client JetStream.
@@ -164,6 +166,13 @@ func New(cfg *Config) *Client {
 func (n *Client) UseLogger(logger any) {
 	if l, ok := logger.(pubsub.Logger); ok {
 		n.Logger = l
+	}
+}
+
+// UseTracer sets the tracer for the NATS client.
+func (n *Client) UseTracer(tracer any) {
+	if t, ok := tracer.(trace.Tracer); ok {
+		n.Tracer = t
 	}
 }
 
