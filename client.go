@@ -289,8 +289,6 @@ func (n *Client) fetchAndProcessMessage(ctx context.Context, cons jetstream.Cons
 	msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(n.Config.MaxWait))
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			n.Logger.Debugf("No message received for topic %s, continuing to listen", topic)
-
 			return nil, errTimeoutWaitingForMsg
 		}
 

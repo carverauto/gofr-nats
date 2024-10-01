@@ -222,12 +222,13 @@ func TestNATSClient_SubscribeTimeout(t *testing.T) {
 		Logger:        logging.NewMockLogger(logging.DEBUG),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
+	ctx := context.Background()
 
 	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_total_count", "topic", "test-subject")
 	mockJS.EXPECT().CreateOrUpdateConsumer(gomock.Any(), client.Config.Stream.Stream, gomock.Any()).Return(mockConsumer, nil)
-	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(mockMsgBatch, context.DeadlineExceeded)
+	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(mockMsgBatch, nil)
+	mockMsgBatch.EXPECT().Messages().Return(make(chan jetstream.Msg)) // Return an empty channel to simulate timeout
+	mockMsgBatch.EXPECT().Error().Return(nil).AnyTimes()              // Add this line
 
 	msg, err := client.Subscribe(ctx, "test-subject")
 
