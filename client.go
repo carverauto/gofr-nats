@@ -286,7 +286,7 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 	}
 
 	// Use a timeout to avoid blocking indefinitely
-	timeoutCtx, cancel := context.WithTimeout(ctx, n.Config.MaxWait)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	select {
