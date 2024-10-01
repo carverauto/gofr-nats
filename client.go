@@ -225,8 +225,8 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		return nil, fmt.Errorf("failed to ensure subscription: %w", err)
 	}
 
-	// Use a timeout to avoid blocking indefinitely
-	timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// Use a longer timeout to avoid frequent timeouts
+	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	select {
@@ -290,16 +290,20 @@ func (n *Client) fetchMessages(ctx context.Context, cons jetstream.Consumer, top
 		case <-ctx.Done():
 			return
 		default:
+			n.Logger.Debugf("Fetching messages for topic %s", topic)
 			msgs, err := cons.Fetch(n.bufferSize, jetstream.FetchMaxWait(n.Config.MaxWait))
 			if err != nil {
-				if !errors.Is(err, context.DeadlineExceeded) {
+				if err != context.DeadlineExceeded {
 					n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
+				} else {
+					n.Logger.Debugf("No messages available for topic %s", topic)
 				}
 				time.Sleep(time.Second) // Wait before retrying
 				continue
 			}
 
 			for msg := range msgs.Messages() {
+				n.Logger.Debugf("Received message for topic %s", topic)
 				select {
 				case n.messageBuffer <- &pubsub.Message{
 					Topic:     topic,
@@ -307,6 +311,7 @@ func (n *Client) fetchMessages(ctx context.Context, cons jetstream.Consumer, top
 					MetaData:  msg.Headers(),
 					Committer: &natsCommitter{msg: msg},
 				}:
+					n.Logger.Debugf("Buffered message for topic %s", topic)
 				case <-ctx.Done():
 					return
 				}
