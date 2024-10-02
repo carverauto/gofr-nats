@@ -1,5 +1,7 @@
 # gofr-nats
 
+[![golangci-lint](https://github.com/carverauto/gofr-nats/actions/workflows/golangci-lint.yml/badge.svg)](https://github.com/carverauto/gofr-nats/actions/workflows/golangci-lint.yml)
+
 ## Example
 
 ```go
