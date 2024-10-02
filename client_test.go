@@ -167,6 +167,8 @@ func TestNATSClient_SubscribeSuccess(t *testing.T) {
 		},
 		Metrics:       mockMetrics,
 		Subscriptions: make(map[string]*subscription),
+		topicBuffers:  make(map[string]chan *pubsub.Message),
+		bufferSize:    1,
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -174,14 +176,14 @@ func TestNATSClient_SubscribeSuccess(t *testing.T) {
 
 	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_total_count", "topic", "test-subject")
 	mockJS.EXPECT().CreateOrUpdateConsumer(gomock.Any(), client.Config.Stream.Stream, gomock.Any()).Return(mockConsumer, nil)
-	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(mockMsgBatch, nil)
+	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(mockMsgBatch, nil).AnyTimes()
 
 	msgChan := make(chan jetstream.Msg, 1)
 	msgChan <- mockMsg
 	close(msgChan)
 
-	mockMsgBatch.EXPECT().Messages().Return(msgChan)
-	mockMsgBatch.EXPECT().Error().Return(nil)
+	mockMsgBatch.EXPECT().Messages().Return(msgChan).AnyTimes() // Allow multiple calls to Messages()
+	mockMsgBatch.EXPECT().Error().Return(nil).AnyTimes()
 
 	mockMsg.EXPECT().Data().Return([]byte("test message"))
 	mockMsg.EXPECT().Headers().Return(nil)
@@ -214,27 +216,30 @@ func TestNATSClient_SubscribeTimeout(t *testing.T) {
 				Subjects: []string{"test-subject"},
 			},
 			Consumer:  "test-consumer",
-			MaxWait:   100 * time.Millisecond,
+			MaxWait:   10 * time.Millisecond, // Reduced timeout for faster test
 			BatchSize: 1,
 		},
 		Metrics:       mockMetrics,
 		Subscriptions: make(map[string]*subscription),
+		topicBuffers:  make(map[string]chan *pubsub.Message),
+		bufferSize:    1,
 		Logger:        logging.NewMockLogger(logging.DEBUG),
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
 
 	mockMetrics.EXPECT().IncrementCounter(gomock.Any(), "app_pubsub_subscribe_total_count", "topic", "test-subject")
 	mockJS.EXPECT().CreateOrUpdateConsumer(gomock.Any(), client.Config.Stream.Stream, gomock.Any()).Return(mockConsumer, nil)
-	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(mockMsgBatch, nil)
-	mockMsgBatch.EXPECT().Messages().Return(make(chan jetstream.Msg)) // Return an empty channel to simulate timeout
-	mockMsgBatch.EXPECT().Error().Return(nil).AnyTimes()              // Add this line
+	mockConsumer.EXPECT().Fetch(gomock.Any(), gomock.Any()).Return(mockMsgBatch, nil).AnyTimes()
+	mockMsgBatch.EXPECT().Messages().Return(make(chan jetstream.Msg)).AnyTimes() // Return an empty channel to simulate timeout
+	mockMsgBatch.EXPECT().Error().Return(nil).AnyTimes()
 
 	msg, err := client.Subscribe(ctx, "test-subject")
 
 	require.Error(t, err)
 	assert.Nil(t, msg)
-	assert.Equal(t, errTimeoutWaitingForMsg, err)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestNATSClient_SubscribeError(t *testing.T) {
@@ -324,11 +329,14 @@ func TestNew(t *testing.T) {
 	natsClient := New(config)
 	assert.NotNil(t, natsClient)
 
-	// Check Client struct
+	// Check PubSubWrapper struct
+	assert.NotNil(t, natsClient)
 	assert.NotNil(t, natsClient.Client)
+
+	// Check Client struct
 	assert.Equal(t, config, natsClient.Client.Config)
 	assert.NotNil(t, natsClient.Client.Subscriptions)
-	assert.NotNil(t, natsClient.Client.messageBuffer)
+	assert.NotNil(t, natsClient.Client.topicBuffers)
 	assert.Equal(t, config.BatchSize, natsClient.Client.bufferSize)
 
 	// Check methods

@@ -16,6 +16,8 @@ import (
 
 //go:generate mockgen -destination=mock_jetstream.go -package=nats github.com/nats-io/nats.go/jetstream JetStream,Stream,Consumer,Msg,MessageBatch
 
+const consumeMessageDelay = 100 * time.Millisecond
+
 // Config defines the Client Client configuration.
 type Config struct {
 	Server      string
@@ -54,6 +56,8 @@ type Client struct {
 	Tracer        trace.Tracer
 	messageBuffer chan *pubsub.Message
 	bufferSize    int
+	topicBuffers  map[string]chan *pubsub.Message
+	bufferMu      sync.RWMutex
 }
 
 // CreateTopic creates a new topic (stream) in Client JetStream.
@@ -116,7 +120,7 @@ func New(cfg *Config) *PubSubWrapper {
 	client := &Client{
 		Config:        cfg,
 		Subscriptions: make(map[string]*subscription),
-		messageBuffer: make(chan *pubsub.Message, cfg.BatchSize),
+		topicBuffers:  make(map[string]chan *pubsub.Message),
 		bufferSize:    cfg.BatchSize,
 	}
 
@@ -235,6 +239,20 @@ func (n *Client) Publish(ctx context.Context, subject string, message []byte) er
 	return nil
 }
 
+func (n *Client) getOrCreateBuffer(topic string) chan *pubsub.Message {
+	n.bufferMu.Lock()
+	defer n.bufferMu.Unlock()
+
+	if buffer, exists := n.topicBuffers[topic]; exists {
+		return buffer
+	}
+
+	buffer := make(chan *pubsub.Message, n.bufferSize)
+	n.topicBuffers[topic] = buffer
+
+	return buffer
+}
+
 func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
 	n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_total_count", "topic", topic)
 
@@ -242,49 +260,74 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		return nil, err
 	}
 
-	cons, err := n.createOrUpdateConsumer(ctx, topic)
-	if err != nil {
-		return nil, err
-	}
+	n.subMu.Lock()
 
-	msgChan := make(chan *pubsub.Message, 1)
-	errChan := make(chan error, 1)
-
-	consumeCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	_, err = cons.Consume(func(msg jetstream.Msg) {
-		select {
-		case <-consumeCtx.Done():
-			return
-		default:
-			pubsubMsg := &pubsub.Message{
-				Topic:     topic,
-				Value:     msg.Data(),
-				MetaData:  msg.Headers(),
-				Committer: &natsCommitter{msg: msg},
-			}
-			select {
-			case msgChan <- pubsubMsg:
-				// Message sent successfully
-			default:
-				// Channel is full, ack the message to prevent redelivery
-				msg.Ack()
-			}
+	_, exists := n.Subscriptions[topic]
+	if !exists {
+		cons, err := n.createOrUpdateConsumer(ctx, topic)
+		if err != nil {
+			n.subMu.Unlock()
+			return nil, err
 		}
-	})
 
-	if err != nil {
-		return nil, err
+		subCtx, cancel := context.WithCancel(context.Background())
+		n.Subscriptions[topic] = &subscription{cancel: cancel}
+
+		buffer := n.getOrCreateBuffer(topic)
+		go n.consumeMessages(subCtx, cons, topic, buffer)
 	}
+
+	n.subMu.Unlock()
+
+	buffer := n.getOrCreateBuffer(topic)
 
 	select {
-	case msg := <-msgChan:
+	case msg := <-buffer:
+		n.Metrics.IncrementCounter(ctx, "app_pubsub_subscribe_success_count", "topic", topic)
 		return msg, nil
-	case err := <-errChan:
-		return nil, err
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func (n *Client) consumeMessages(ctx context.Context, cons jetstream.Consumer, topic string, buffer chan *pubsub.Message) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(n.Config.MaxWait))
+			if err != nil {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
+				}
+
+				time.Sleep(consumeMessageDelay) // Add a small delay to avoid tight loop
+
+				continue
+			}
+
+			for msg := range msgs.Messages() {
+				pubsubMsg := pubsub.NewMessage(ctx)
+				pubsubMsg.Topic = topic
+				pubsubMsg.Value = msg.Data()
+				pubsubMsg.MetaData = msg.Headers()
+				pubsubMsg.Committer = &natsCommitter{msg: msg}
+
+				select {
+				case buffer <- pubsubMsg:
+					// Message sent successfully
+				default:
+					// Buffer is full, log a warning
+					// TODO: implement backoff strategy
+					n.Logger.Logf("Message buffer is full for topic %s. Consider increasing buffer size or processing messages faster.", topic)
+				}
+			}
+
+			if err := msgs.Error(); err != nil {
+				n.Logger.Errorf("Error in message batch for topic %s: %v", topic, err)
+			}
+		}
 	}
 }
 
@@ -320,64 +363,6 @@ func (n *Client) createOrUpdateConsumer(ctx context.Context, topic string) (jets
 	return cons, nil
 }
 
-func (n *Client) fetchAndProcessMessage(ctx context.Context, cons jetstream.Consumer, topic string) (*pubsub.Message, error) {
-	fetchCtx, cancel := context.WithTimeout(ctx, 1*time.Second) // Use a shorter timeout
-	defer cancel()
-
-	msgs, err := cons.Fetch(1)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, errTimeoutWaitingForMsg
-		}
-		return nil, n.handleFetchError(err, topic)
-	}
-
-	select {
-	case msg := <-msgs.Messages():
-		if msg == nil {
-			return nil, errNoMsgReceivedForTopic
-		}
-		return n.handleReceivedMessage(msg, msgs, topic)
-	case <-fetchCtx.Done():
-		return nil, errTimeoutWaitingForMsg
-	}
-}
-
-func (n *Client) handleFetchError(err error, topic string) error {
-	if errors.Is(err, context.DeadlineExceeded) {
-		n.Logger.Debugf("Timeout waiting for message on topic %s", topic)
-
-		return errTimeoutWaitingForMsg
-	}
-
-	n.Logger.Errorf("Error fetching messages for topic %s: %v", topic, err)
-
-	return errFetchMsgError
-}
-
-func (n *Client) handleReceivedMessage(msg jetstream.Msg, msgs jetstream.MessageBatch, topic string) (*pubsub.Message, error) {
-	if msg == nil {
-		n.Logger.Debugf("No messages received for topic %s", topic)
-
-		return nil, errNoMsgReceivedForTopic
-	}
-
-	if fetchErr := msgs.Error(); fetchErr != nil {
-		n.Logger.Errorf("Error in message batch for topic %s: %v", topic, fetchErr)
-
-		return nil, fetchErr
-	}
-
-	n.Metrics.IncrementCounter(context.Background(), "app_pubsub_subscribe_success_count", "topic", topic)
-
-	return &pubsub.Message{
-		Topic:     topic,
-		Value:     msg.Data(),
-		MetaData:  msg.Headers(),
-		Committer: &natsCommitter{msg: msg},
-	}, nil
-}
-
 // HandleMessage handles a message from a consumer.
 func (n *Client) HandleMessage(ctx context.Context, msg jetstream.Msg, handler messageHandler) error {
 	if err := handler(ctx, msg); err != nil {
@@ -406,7 +391,7 @@ func (n *Client) HandleFetchError(err error) {
 	time.Sleep(time.Second) // Backoff on error
 }
 
-// Close closes the Client Client.
+// Close closes the Client.
 func (n *Client) Close() error {
 	n.subMu.Lock()
 	for _, sub := range n.Subscriptions {
@@ -415,6 +400,14 @@ func (n *Client) Close() error {
 
 	n.Subscriptions = make(map[string]*subscription)
 	n.subMu.Unlock()
+
+	n.bufferMu.Lock()
+	for _, buffer := range n.topicBuffers {
+		close(buffer)
+	}
+
+	n.topicBuffers = make(map[string]chan *pubsub.Message)
+	n.bufferMu.Unlock()
 
 	if n.Conn != nil {
 		n.Conn.Close()

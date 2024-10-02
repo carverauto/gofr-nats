@@ -17,8 +17,5 @@ var (
 	errNATSConnNil                = errors.New("NATS connection is nil")
 
 	// Message Errors.
-	errHandlerError          = errors.New("handler error")
-	errNoMsgReceivedForTopic = errors.New("no message received for topic")
-	errTimeoutWaitingForMsg  = errors.New("timeout waiting for message")
-	errFetchMsgError         = errors.New("fetch message error")
+	errHandlerError = errors.New("handler error")
 )
