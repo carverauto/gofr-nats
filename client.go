@@ -247,7 +247,45 @@ func (n *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, 
 		return nil, err
 	}
 
-	return n.fetchAndProcessMessage(ctx, cons, topic)
+	msgChan := make(chan *pubsub.Message, 1)
+	errChan := make(chan error, 1)
+
+	consumeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	_, err = cons.Consume(func(msg jetstream.Msg) {
+		select {
+		case <-consumeCtx.Done():
+			return
+		default:
+			pubsubMsg := &pubsub.Message{
+				Topic:     topic,
+				Value:     msg.Data(),
+				MetaData:  msg.Headers(),
+				Committer: &natsCommitter{msg: msg},
+			}
+			select {
+			case msgChan <- pubsubMsg:
+				// Message sent successfully
+			default:
+				// Channel is full, ack the message to prevent redelivery
+				msg.Ack()
+			}
+		}
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	select {
+	case msg := <-msgChan:
+		return msg, nil
+	case err := <-errChan:
+		return nil, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (n *Client) validateSubscribePrerequisites() error {
@@ -283,15 +321,14 @@ func (n *Client) createOrUpdateConsumer(ctx context.Context, topic string) (jets
 }
 
 func (n *Client) fetchAndProcessMessage(ctx context.Context, cons jetstream.Consumer, topic string) (*pubsub.Message, error) {
-	fetchCtx, cancel := context.WithTimeout(ctx, n.Config.MaxWait)
+	fetchCtx, cancel := context.WithTimeout(ctx, 1*time.Second) // Use a shorter timeout
 	defer cancel()
 
-	msgs, err := cons.Fetch(1, jetstream.FetchMaxWait(n.Config.MaxWait))
+	msgs, err := cons.Fetch(1)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, errTimeoutWaitingForMsg
 		}
-
 		return nil, n.handleFetchError(err, topic)
 	}
 
@@ -300,7 +337,6 @@ func (n *Client) fetchAndProcessMessage(ctx context.Context, cons jetstream.Cons
 		if msg == nil {
 			return nil, errNoMsgReceivedForTopic
 		}
-
 		return n.handleReceivedMessage(msg, msgs, topic)
 	case <-fetchCtx.Done():
 		return nil, errTimeoutWaitingForMsg
