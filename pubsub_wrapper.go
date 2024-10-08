@@ -3,7 +3,6 @@ package nats
 import (
 	"context"
 
-	"github.com/nats-io/nats.go"
 	"gofr.dev/pkg/gofr/datasource"
 	"gofr.dev/pkg/gofr/datasource/pubsub"
 )
@@ -35,27 +34,21 @@ func (w *PubSubWrapper) DeleteTopic(ctx context.Context, name string) error {
 
 // Close closes the Client.
 func (w *PubSubWrapper) Close() error {
-	return w.Client.Close()
+	ctx := context.Background()
+	return w.Client.Close(ctx)
 }
 
 // Health returns the health status of the Client.
 func (w *PubSubWrapper) Health() datasource.Health {
-	status := datasource.StatusUp
-	if w.Client.Conn == nil || w.Client.Conn.Status() != nats.CONNECTED {
-		status = datasource.StatusDown
-	}
-
-	return datasource.Health{
-		Status: status,
-		Details: map[string]interface{}{
-			"server": w.Client.Config.Server,
-		},
-	}
+	return w.Client.Health()
 }
 
 // Connect establishes a connection to NATS.
 func (w *PubSubWrapper) Connect() {
-	w.Client.Connect()
+	err := w.Client.Connect()
+	if err != nil {
+		w.Client.logger.Errorf("Error connecting to NATS: %v", err)
+	}
 }
 
 // UseLogger sets the logger for the NATS client.
