@@ -2,6 +2,8 @@ package nats
 
 import (
 	"time"
+
+	"gofr.dev/pkg/gofr/datasource/pubsub"
 )
 
 // Config defines the Client configuration.
@@ -25,7 +27,7 @@ type StreamConfig struct {
 }
 
 // New creates a new Client.
-func New(cfg *Config) *PubSubWrapper {
+func New(cfg *Config, logger pubsub.Logger) *PubSubWrapper {
 	if cfg == nil {
 		cfg = &Config{}
 	}
@@ -37,6 +39,7 @@ func New(cfg *Config) *PubSubWrapper {
 	client := &Client{
 		Config:     cfg,
 		subManager: NewSubscriptionManager(cfg.BatchSize),
+		logger:     logger,
 	}
 
 	return &PubSubWrapper{Client: client}

@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"fmt"
 
 	"gofr.dev/pkg/gofr/datasource"
 	"gofr.dev/pkg/gofr/datasource/pubsub"
@@ -45,9 +46,15 @@ func (w *PubSubWrapper) Health() datasource.Health {
 
 // Connect establishes a connection to NATS.
 func (w *PubSubWrapper) Connect() {
+	fmt.Println("Connecting to NATS using PubSubWrapper")
+	if w.Client.connManager != nil && w.Client.connManager.Health().Status == datasource.StatusUp {
+		w.Client.logger.Log("NATS connection already established")
+		return
+	}
+
 	err := w.Client.Connect()
 	if err != nil {
-		w.Client.logger.Errorf("Error connecting to NATS: %v", err)
+		w.Client.logger.Errorf("PubSubWrapper: Error connecting to NATS: %v", err)
 	}
 }
 

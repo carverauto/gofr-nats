@@ -56,6 +56,20 @@ func NewConnectionManager(
 	logger pubsub.Logger,
 	natsConnector NATSConnector,
 	jetStreamCreator JetStreamCreator) *ConnectionManager {
+
+	// if logger is nil panic
+	if logger == nil {
+		panic("logger is required")
+	}
+
+	if natsConnector == nil {
+		natsConnector = &DefaultNATSConnector{}
+	}
+
+	if jetStreamCreator == nil {
+		jetStreamCreator = &DefaultJetStreamCreator{}
+	}
+
 	return &ConnectionManager{
 		config:           cfg,
 		logger:           logger,
@@ -66,7 +80,15 @@ func NewConnectionManager(
 
 // Connect establishes a connection to NATS and sets up JetStream.
 func (cm *ConnectionManager) Connect() error {
-	connInterface, err := cm.natsConnector.Connect(cm.config.Server, nats.Name("GoFr NATS JetStreamClient"))
+	cm.logger.Logf("Connecting to NATS server at %v", cm.config.Server)
+
+	opts := []nats.Option{nats.Name("GoFr NATS JetStreamClient")}
+
+	if cm.config.CredsFile != "" {
+		opts = append(opts, nats.UserCredentials(cm.config.CredsFile))
+	}
+
+	connInterface, err := cm.natsConnector.Connect(cm.config.Server, opts...)
 	if err != nil {
 		cm.logger.Errorf("failed to connect to NATS server at %v: %v", cm.config.Server, err)
 
