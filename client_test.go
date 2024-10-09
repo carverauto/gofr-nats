@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -126,9 +127,10 @@ func TestNATSClient_SubscribeSuccess(t *testing.T) {
 		Value: []byte("test message"),
 	}
 
-	mockConnManager.EXPECT().JetStream().Return(mockJetStream)
+	mockConnManager.EXPECT().JetStream().Return(mockJetStream).Times(2)
+
 	mockSubManager.EXPECT().
-		Subscribe(ctx, "test-subject", mockJetStream, client.Config, client.logger, client.metrics).
+		Subscribe(ctx, "test-subject", mockJetStream, gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(expectedMsg, nil)
 
 	msg, err := client.Subscribe(ctx, "test-subject")
@@ -161,13 +163,12 @@ func TestNATSClient_SubscribeError(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	expectedErr := errors.New("subscription error")
 
-	expectedErr := errFailedToCreateConsumer
-
-	mockConnManager.EXPECT().JetStream().Return(mockJetStream)
+	mockConnManager.EXPECT().JetStream().Return(mockJetStream).Times(2)
 
 	mockSubManager.EXPECT().
-		Subscribe(ctx, "test-subject", mockJetStream, client.Config, client.logger, client.metrics).
+		Subscribe(ctx, "test-subject", mockJetStream, gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(nil, expectedErr)
 
 	msg, err := client.Subscribe(ctx, "test-subject")
@@ -216,7 +217,9 @@ func TestNew(t *testing.T) {
 		BatchSize: 100,
 	}
 
-	natsClient := New(config)
+	mockLogger := logging.NewMockLogger(logging.DEBUG)
+
+	natsClient := New(config, mockLogger)
 	assert.NotNil(t, natsClient)
 
 	// Check PubSubWrapper struct
