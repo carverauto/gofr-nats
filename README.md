@@ -36,7 +36,7 @@ func main() {
 	})
 	natsClient.UseLogger(app.Logger)
 	natsClient.UseMetrics(app.Metrics())
-	natsClient.Connect()
+	
 	app.AddPubSub(natsClient)
 
 	app.Subscribe("events.products", func(c *gofr.Context) error {
