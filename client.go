@@ -95,19 +95,6 @@ func (c *Client) Publish(ctx context.Context, subject string, message []byte) er
 
 // Subscribe subscribes to a topic and returns a single message.
 func (c *Client) Subscribe(ctx context.Context, topic string) (*pubsub.Message, error) {
-
-	if c.subManager == nil {
-		return nil, errors.New("subscription manager is not initialized")
-	}
-
-	if c.connManager == nil {
-		return nil, errors.New("connection manager is not initialized")
-	}
-
-	if c.connManager.JetStream() == nil {
-		return nil, errors.New("jetstream is not initialized")
-	}
-
 	return c.subManager.Subscribe(ctx, topic, c.connManager.JetStream(), c.Config, c.logger, c.metrics)
 }
 

@@ -56,7 +56,6 @@ func NewConnectionManager(
 	logger pubsub.Logger,
 	natsConnector NATSConnector,
 	jetStreamCreator JetStreamCreator) *ConnectionManager {
-
 	// if logger is nil panic
 	if logger == nil {
 		panic("logger is required")

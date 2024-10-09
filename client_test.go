@@ -2,7 +2,6 @@ package nats
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -163,7 +162,7 @@ func TestNATSClient_SubscribeError(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	expectedErr := errors.New("subscription error")
+	expectedErr := errSubscriptionError
 
 	mockConnManager.EXPECT().JetStream().Return(mockJetStream).Times(2)
 
