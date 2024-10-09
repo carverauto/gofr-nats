@@ -25,8 +25,12 @@ type ConnectionManager struct {
 	jetStreamCreator JetStreamCreator
 }
 
-func (cm *ConnectionManager) JetStream() jetstream.JetStream {
-	return cm.jetStream
+func (cm *ConnectionManager) JetStream() (jetstream.JetStream, error) {
+	if cm.jetStream == nil {
+		return nil, errJetStreamNotConfigured
+	}
+
+	return cm.jetStream, nil
 }
 
 // natsConnWrapper wraps a nats.Conn to implement the ConnInterface.
