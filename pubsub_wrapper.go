@@ -44,14 +44,14 @@ func (w *PubSubWrapper) Health() datasource.Health {
 }
 
 // Connect establishes a connection to NATS.
-func (w *PubSubWrapper) Connect() error {
+func (w *PubSubWrapper) Connect(ctx context.Context) error {
 	if w.Client.connManager != nil && w.Client.connManager.Health().Status == datasource.StatusUp {
 		w.Client.logger.Log("NATS connection already established")
 
 		return nil
 	}
 
-	err := w.Client.Connect()
+	err := w.Client.Connect(ctx)
 	if err != nil {
 		w.Client.logger.Errorf("PubSubWrapper: Error connecting to NATS: %v", err)
 		return err

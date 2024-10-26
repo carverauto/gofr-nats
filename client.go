@@ -32,13 +32,13 @@ type Client struct {
 type messageHandler func(context.Context, jetstream.Msg) error
 
 // Connect establishes a connection to NATS and sets up JetStream.
-func (c *Client) Connect() error {
+func (c *Client) Connect(ctx context.Context) error {
 	if err := c.validateAndPrepare(); err != nil {
 		return err
 	}
 
 	connManager := NewConnectionManager(c.Config, c.logger, c.natsConnector, c.jetStreamCreator)
-	if err := connManager.Connect(); err != nil {
+	if err := connManager.Connect(ctx); err != nil {
 		c.logger.Errorf("failed to connect to NATS server at %v: %v", c.Config.Server, err)
 		return err
 	}
