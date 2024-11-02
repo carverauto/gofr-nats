@@ -50,8 +50,8 @@ func (c *Client) Connect(ctx context.Context) error {
 		return err
 	}
 
-	c.streamManager = NewStreamManager(js, c.logger)
-	c.subManager = NewSubscriptionManager(c.Config.BatchSize)
+	c.streamManager = newStreamManager(js, c.logger)
+	c.subManager = newSubscriptionManager(batchSize)
 	c.logSuccessfulConnection()
 
 	return nil

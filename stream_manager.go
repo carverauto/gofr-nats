@@ -14,8 +14,8 @@ type StreamManager struct {
 	logger pubsub.Logger
 }
 
-// NewStreamManager creates a new StreamManager.
-func NewStreamManager(js jetstream.JetStream, logger pubsub.Logger) *StreamManager {
+// newStreamManager creates a new StreamManager.
+func newStreamManager(js jetstream.JetStream, logger pubsub.Logger) *StreamManager {
 	return &StreamManager{
 		js:     js,
 		logger: logger,
