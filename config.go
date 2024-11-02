@@ -64,7 +64,6 @@ func DefaultConfig() *Config {
 	return &Config{
 		MaxWait:     5 * time.Second,
 		MaxPullWait: 10,
-		BatchSize:   100,
 		Stream: StreamConfig{
 			MaxDeliver: 3,
 			MaxWait:    30 * time.Second,
