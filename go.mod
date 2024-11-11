@@ -7,8 +7,8 @@ require (
 	github.com/nats-io/nats.go v1.37.0
 	github.com/stretchr/testify v1.9.0
 	go.opentelemetry.io/otel/trace v1.31.0
-	go.uber.org/mock v0.4.0
-	gofr.dev v1.23.0
+	go.uber.org/mock v0.5.0
+	gofr.dev v1.26.0
 )
 
 require (
@@ -26,6 +26,6 @@ require (
 	golang.org/x/sys v0.26.0 // indirect
 	golang.org/x/term v0.25.0 // indirect
 	golang.org/x/text v0.19.0 // indirect
-	golang.org/x/time v0.6.0 // indirect
+	golang.org/x/time v0.7.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
