@@ -8,7 +8,7 @@ require (
 	github.com/stretchr/testify v1.9.0
 	go.opentelemetry.io/otel/trace v1.32.0
 	go.uber.org/mock v0.5.0
-	gofr.dev v1.26.0
+	gofr.dev v1.27.1
 )
 
 require (
