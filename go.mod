@@ -5,8 +5,8 @@ go 1.23.1
 require (
 	github.com/nats-io/nats-server/v2 v2.10.21
 	github.com/nats-io/nats.go v1.37.0
-	github.com/stretchr/testify v1.9.0
-	go.opentelemetry.io/otel/trace v1.32.0
+	github.com/stretchr/testify v1.10.0
+	go.opentelemetry.io/otel/trace v1.33.0
 	go.uber.org/mock v0.5.0
 	gofr.dev v1.26.0
 )
@@ -21,7 +21,7 @@ require (
 	github.com/nats-io/nuid v1.0.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	go.opentelemetry.io/otel v1.32.0 // indirect
+	go.opentelemetry.io/otel v1.33.0 // indirect
 	golang.org/x/crypto v0.29.0 // indirect
 	golang.org/x/sys v0.27.0 // indirect
 	golang.org/x/term v0.26.0 // indirect
